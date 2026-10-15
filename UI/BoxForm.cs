@@ -1043,9 +1043,54 @@ internal sealed class BoxForm : Form
         _menuItem = item;
         if (_titleEditor != null) CommitBoxRename();
 
-        // 点到项 → 项菜单；点在标题 / 空白 → 格子菜单
-        if (item != null) { _itemMenu.Show(screenPoint); return; }
+        // 点到图标 → **系统原生右键菜单**，与在资源管理器里右键这个文件完全一致。
+        // 本程序自己的操作（归类 / 格子管理）一律不掺进来，改在格子空白处 / 标题处提供。
+        if (item != null)
+        {
+            if (ShowShellItemMenu(screenPoint)) return;
+            _itemMenu.Show(screenPoint);      // 原生菜单建立失败时的兜底
+            return;
+        }
+
+        // 点在标题 / 空白 → 格子菜单（格子管理与选中项操作都在这里）
         _boxMenu.Show(screenPoint);
+    }
+
+    // ───────── 图标右键：系统原生菜单 ─────────
+
+    /// <summary>
+    /// 在图标上右键 → 弹**系统原生**右键菜单。
+    ///
+    /// 这里**不追加任何自有项**，菜单内容与「在资源管理器里右键这个文件」完全一致：
+    ///   「打开方式」「发送到」「属性」，以及所有装过的 shell 扩展（压缩、版本控制、编辑器…）。
+    ///   这些是我们永远枚举不全的，而用户点图标右键时想要的多半正是它们。
+    ///
+    /// 本程序独有的能力（按规则自动归类 / 以此格子为准 / 格子管理）统一挪到
+    /// 「格子空白处 · 格子标题」的右键菜单里 —— 两类操作不再挤在同一个菜单里。
+    ///
+    /// 多选时把整个选择集交给 Shell，菜单自然会长出「剪切/复制 + N 个文件」这类复合项。
+    /// </summary>
+    /// <returns>true = 原生菜单已弹出；false = 建不起来，调用方回退到自带菜单</returns>
+    private bool ShowShellItemMenu(Point screenPoint)
+    {
+        var targets = MenuTargets;
+        if (targets.Count == 0) return false;
+
+        var paths = new string[targets.Count];
+        for (int i = 0; i < targets.Count; i++) paths[i] = targets[i].Path;
+
+        // 按住 Shift 右键 → 扩展动词（与资源管理器一致）
+        bool extended = (ModifierKeys & Keys.Shift) != 0;
+
+        return ShellMenu.TryShow(Handle, screenPoint, paths, null, extended, out _);
+    }
+
+    /// <summary>在资源管理器中定位当前项（选中态），虚拟项 / 多项选择都不可用</summary>
+    private void LocateInExplorer()
+    {
+        var t = MenuTargets;
+        if (t.Count != 1 || t[0].IsVirtual) return;   // 虚拟项没有磁盘位置
+        try { Process.Start("explorer.exe", $"/select,\"{t[0].Path}\""); } catch { }
     }
 
     /// <summary>
@@ -1064,8 +1109,37 @@ internal sealed class BoxForm : Form
     private ContextMenuStrip BuildBoxMenu()
     {
         var m = new ContextMenuStrip();
-        m.Items.Add("一键整理桌面", null, (_, _) => _onItemsChanged());
+
+        // ── 一、选中项的操作 ──
+        //
+        // 图标右键已经交还给系统原生菜单，本程序自己的这些能力（就地改名、复制路径、
+        // 定位、按规则归类、钉住位置、删除）没有别处可放，统一收到这里。
+        //
+        // 没有选中项时整段隐藏 —— 空白处右键就只剩格子管理，不会出现点了没反应的项。
+        // 注意：右键点到图标时**先选它再弹菜单**，所以「右键图标 → 空白处」之外，
+        // 直接从空白处右键也能操作当前选择集（见 MenuTargets）。
+        var miRenameItem = new ToolStripMenuItem("重命名", null, (_, _) => _view.BeginRenameSelected());
+        var miCopyPath = new ToolStripMenuItem("复制完整路径", null, (_, _) => CopySelectedPaths());
+        var miLocate = new ToolStripMenuItem("打开所在文件夹", null, (_, _) => LocateInExplorer());
+        var miAuto = new ToolStripMenuItem("按规则自动归类", null, (_, _) => ClearAssignSelected());
+        var miPinHere = new ToolStripMenuItem("以此格子为准（记住位置）", null, (_, _) => PinSelected());
+        var miDeleteItem = new ToolStripMenuItem("删除", null, (_, _) => DeleteFromMenu());
+
+        var miSelHead = new ToolStripSeparator();
+        var miSelFoot = new ToolStripSeparator();
+        m.Items.Add(miSelHead);
+        m.Items.Add(miRenameItem);
+        m.Items.Add(miCopyPath);
+        m.Items.Add(miLocate);
         m.Items.Add(new ToolStripSeparator());
+        m.Items.Add(miAuto);
+        m.Items.Add(miPinHere);
+        m.Items.Add(new ToolStripSeparator());
+        m.Items.Add(miDeleteItem);
+        m.Items.Add(miSelFoot);
+
+        // ── 二、格子管理 ──
+        m.Items.Add("一键整理桌面", null, (_, _) => _onItemsChanged());
 
         var miCollapse = new ToolStripMenuItem("折叠格子", null, (_, _) => ToggleCollapse());
         m.Items.Add(miCollapse);
@@ -1084,6 +1158,30 @@ internal sealed class BoxForm : Form
 
         m.Opening += (_, _) =>
         {
+            var targets = MenuTargets;
+            int n = targets.Count;
+            bool multi = n > 1;
+            bool hasAny = n > 0;
+
+            // 虚拟项（此电脑 / 回收站 / 网络）没有磁盘实体：不能重命名、不能定位、不能删除
+            bool anyReal = targets.Any(i => !i.IsVirtual);
+            bool singleReal = n == 1 && !targets[0].IsVirtual;
+
+            string suffix = multi ? $"（{n} 项）" : "";
+            miCopyPath.Text = "复制完整路径" + suffix;
+            miAuto.Text = "按规则自动归类" + suffix;
+            miPinHere.Text = "以此格子为准（记住位置）" + suffix;
+            miDeleteItem.Text = "删除" + suffix;
+
+            // 没有作用对象时整段（含前后分隔线）隐藏，菜单不会出现点了没反应的项
+            miSelHead.Visible = miSelFoot.Visible = hasAny;
+            miRenameItem.Visible = miCopyPath.Visible = miLocate.Visible = hasAny;
+            miAuto.Visible = miPinHere.Visible = miDeleteItem.Visible = hasAny;
+
+            miRenameItem.Enabled = singleReal;   // 就地改名只对单项有意义
+            miLocate.Enabled = singleReal;       // 「打开所在文件夹」同理
+            miDeleteItem.Enabled = anyReal;
+
             miCollapse.Text = _box.Collapsed ? "展开格子" : "折叠格子";
 
             // 只有手工调过尺寸才给「恢复自动贴合」—— 否则点了也没有变化，徒增困惑
@@ -1179,6 +1277,13 @@ internal sealed class BoxForm : Form
         ed.Dispose();
     }
 
+    /// <summary>
+    /// 图标菜单的**兜底版**：仅在 <see cref="ShellMenu.TryShow"/> 建不起原生菜单时使用
+    /// （Shell 拒绝、路径解析不出来…）。正常情况下图标右键走的是系统原生菜单。
+    ///
+    /// 这里只放「这个文件本身」的操作（打开 / 重命名 / 复制路径 / 定位 / 属性 / 删除），
+    /// **不放**归类与格子管理 —— 那是格子级操作，统一在格子空白处 / 标题的右键菜单里。
+    /// </summary>
     private ContextMenuStrip BuildItemMenu()
     {
         var m = new ContextMenuStrip();
@@ -1208,41 +1313,18 @@ internal sealed class BoxForm : Form
         var miCopyPath = new ToolStripMenuItem("复制完整路径", null, (_, _) => CopySelectedPaths());
         m.Items.Add(miCopyPath);
 
-        var miLocate = new ToolStripMenuItem("打开所在文件夹", null, (_, _) =>
-        {
-            if (_menuItem == null) return;
-            try { Process.Start("explorer.exe", $"/select,\"{_menuItem.Path}\""); } catch { }
-        });
+        var miLocate = new ToolStripMenuItem("打开所在文件夹", null, (_, _) => LocateInExplorer());
         m.Items.Add(miLocate);
         m.Items.Add("属性", null, (_, _) => ShowProperties());
         m.Items.Add(new ToolStripSeparator());
 
-        var miAuto = new ToolStripMenuItem("按规则自动归类", null, (_, _) => ClearAssignSelected());
-        m.Items.Add(miAuto);
-
-        var miUnpin = new ToolStripMenuItem("以此格子为准（记住位置）", null, (_, _) => PinSelected());
-        m.Items.Add(miUnpin);
-
-        m.Items.Add(new ToolStripSeparator());
         var miDelete = new ToolStripMenuItem("删除", null, (_, _) => DeleteFromMenu());
         m.Items.Add(miDelete);
-
-        // ── 格子本身的操作（重命名 / 新建 / 删除）──
-        //
-        // 这几个入口原先只在「右键标题栏或格子空白处」时出现，而格子装满图标之后
-        // 几乎点不到空白处 —— 结果就是用户根本找不到格子管理功能。
-        // 这里在图标菜单里再放一份，右键格子的任意位置都能管理这个格子。
-        m.Items.Add(new ToolStripSeparator());
-        m.Items.Add("重命名此格子…", null, (_, _) => BeginBoxRename());
-        m.Items.Add("新建格子…", null, (_, _) => _onCreateBox?.Invoke());
-        var miDeleteBox = new ToolStripMenuItem("删除此格子…", null, (_, _) => DeleteBox());
-        m.Items.Add(miDeleteBox);
 
         m.Opening += (_, _) =>
         {
             int n = _view.SelectedCount;
             bool multi = n > 1;
-            bool has = multi || _menuItem != null;
 
             // 虚拟项（此电脑 / 回收站 / 网络）没有磁盘实体：不能重命名、不能定位、不能删除。
             // 与其让操作静默失败，不如直接置灰。
@@ -1273,34 +1355,30 @@ internal sealed class BoxForm : Form
             // 多选时菜单文字带数量，明确告诉用户「这一下作用到几项」
             string suffix = multi ? $"（{n} 项）" : "";
             miCopyPath.Text = "复制完整路径" + suffix;
-
-            // 内置格子删不得：其固定 ID 是自动归类规则的落点，删了下次扫描 / 启动还会重建。
-            // 置灰之外还得把原因说清楚，否则用户只会以为是 bug。
-            miDeleteBox.Enabled = !_box.IsBuiltIn;
-            miDeleteBox.Text = _box.IsBuiltIn ? "删除此格子（内置格不可删）" : "删除此格子…";
-            miAuto.Text = "按规则自动归类" + suffix;
-            miUnpin.Text = "以此格子为准（记住位置）" + suffix;
             miDelete.Text = "删除" + suffix;
 
             miRename.Enabled = !multi && real;   // 就地改名只对单项有意义
             miLocate.Enabled = !multi && real;   // 「打开所在文件夹」同理
-            miAuto.Enabled = has;
-            miUnpin.Enabled = has;
             miDelete.Enabled = real;
         };
         return m;
     }
 
     /// <summary>
-    /// 菜单的「当前作用对象」：多选时是整个选择集，单选时退回右键点到的那一项。
-    /// 这样一套菜单代码同时支持单选和批量，不用维护两份。
+    /// 菜单的「当前作用对象」：优先用选择集，没选中时才退回右键点到的那一项。
+    ///
+    /// 为什么不是「多项才用选择集」：格子的右键菜单里，用户可能是**先框选再点空白处**
+    /// 右键的 —— 那时 <c>_menuItem</c> 是 null，若只在多选时认选择集，恰好选中一项时
+    /// 菜单里的操作就会静默失效。
+    ///
+    /// 单条菜单代码同时支持单选 / 多选 / 空白处右键，不用维护两份。
     /// </summary>
     private IReadOnlyList<DiscoveredItem> MenuTargets
     {
         get
         {
             var sel = _view.SelectedItems;
-            if (sel.Count > 1) return sel;
+            if (sel.Count > 0) return sel;
             return _menuItem != null ? new[] { _menuItem } : Array.Empty<DiscoveredItem>();
         }
     }
