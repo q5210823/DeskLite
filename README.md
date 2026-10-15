@@ -40,15 +40,12 @@
 
 ## 运行方式
 
-**环境要求**
+**方式一：下载现成的压缩包**（推荐）
 
-| 项目 | 要求 |
-|---|---|
-| 系统 | Windows 10 / 11（x64） |
-| 运行时 | [.NET 7 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/7.0)（框架依赖模式，产物仅 557 KB） |
-| 权限 | 普通用户即可，无需管理员 |
+到 [Releases](https://github.com/q5210823/DeskLite/releases) 下载 `DeskLite-v1.0.0-win-x64.zip`，
+解压到任意目录，双击 `DeskLite.exe` 即可。启动后常驻托盘，无需安装。
 
-**从源码编译运行**
+**方式二：从源码编译**
 
 ```bash
 git clone https://github.com/q5210823/DeskLite.git
@@ -56,6 +53,14 @@ cd DeskLite
 dotnet build -c Release
 bin\Release\net7.0-windows\DeskLite.exe
 ```
+
+**环境要求**
+
+| 项目 | 要求 |
+|---|---|
+| 系统 | Windows 10 / 11（x64） |
+| 运行时 | [.NET 7 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/7.0)（框架依赖模式，产物仅 557 KB） |
+| 权限 | 普通用户即可，无需管理员 |
 
 启动后常驻托盘，默认接管桌面图标。想退出并还原桌面：托盘右键 →「退出并还原桌面」。
 
