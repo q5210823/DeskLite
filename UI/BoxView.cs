@@ -122,8 +122,8 @@ internal sealed class BoxView : Control
     private int _downIndex = -1;
     private bool _dragStarted;
 
-    // 就地改名
-    private TextBox? _editor;
+    // 就地改名（独立小窗，原因见 RenameBox 的注释）
+    private RenameBox? _renameBox;
 
     private Font? _fTitle, _fLabel;
 
@@ -224,7 +224,7 @@ internal sealed class BoxView : Control
     internal Size CurrentCellSize => new(_cellW, _cellH);
 
     /// <summary>诊断用：是否正处于就地改名状态</summary>
-    internal bool IsRenaming => _editor != null;
+    internal bool IsRenaming => _renameBox != null;
 
     /// <summary>诊断用：选中第 index 项并开始改名（越界则忽略）</summary>
     internal void ProbeRename(int index = 0)
@@ -367,7 +367,7 @@ internal sealed class BoxView : Control
     public void SetItems(IReadOnlyList<DiscoveredItem> items)
     {
         T($"SetItems 开始（{items.Count} 项）");
-        if (_editor != null) CommitEdit();
+        if (_renameBox != null) CommitEdit();
 
         // 选择按**路径**保留：刷新只是重建列表，用户手上的选择不该被清掉
         var keep = new HashSet<string>(
@@ -742,7 +742,6 @@ internal sealed class BoxView : Control
 
         // 文件名：图标下方居中，最多两行，超出省略号
         if (DiagNoText) return;
-        if (_editor != null && index == Primary) return;   // 改名时由 TextBox 接管
 
         var labelRect = new Rectangle(
             cell.Left + (int)(2 * S),
@@ -909,7 +908,7 @@ internal sealed class BoxView : Control
 
         if (e.Button == MouseButtons.Right)
         {
-            if (_editor != null) CommitEdit();
+            if (_renameBox != null) CommitEdit();
             int idx = HitTest(e.Location);
 
             // 右键落在已选中的项上 → 保留整个选择集（批量操作）；
@@ -922,7 +921,9 @@ internal sealed class BoxView : Control
         }
 
         if (e.Button != MouseButtons.Left) return;
-        if (_editor != null && !_editor.Bounds.Contains(e.Location)) CommitEdit();
+
+        // 编辑框是独立小窗，点格子里的任何地方都算「结束了这次改名」
+        if (_renameBox != null) CommitEdit();
 
         // 标题区：交给外层处理拖动 / 双击折叠
         if (e.Y < _titleH) return;
@@ -1079,6 +1080,13 @@ internal sealed class BoxView : Control
 
     public void BeginRenameSelected() => BeginRename(Primary);
 
+    /// <summary>
+    /// 在图标下方弹出就地改名小窗。
+    ///
+    /// 编辑框必须落在**屏幕**坐标上：它是个独立的顶层窗口，不是本视图的子控件
+    /// （原因见 <see cref="RenameBox"/>）。宽度给得比标签宽一些，长文件名才看得全，
+    /// 居中于单元格。
+    /// </summary>
     private void BeginRename(int index)
     {
         if (index < 0 || index >= _items.Count) return;
@@ -1086,60 +1094,41 @@ internal sealed class BoxView : Control
         SelectOnly(index);
         Repaint();
 
+        var item = _items[index];
         var cell = CellRect(index);
-        var r = new Rectangle(
-            cell.Left + (int)(6 * S),
-            cell.Top + _iconSize + (int)(6 * S),
-            cell.Width - (int)(12 * S),
-            _labelLine + (int)(8 * S));
 
-        _editor = new TextBox
+        // 宽度取单元格本身：和 explorer 里就地改名一样，长名靠框内滚动看，
+        // 不做「比图标还宽、压到邻居身上」的漂浮大白框。
+        int w = cell.Width;
+        int h = _labelLine + (int)(10 * S);
+        var rect = new Rectangle(
+            cell.Left + (cell.Width - w) / 2,
+            cell.Top + _iconSize + (int)Math.Round(LabelGapBase * S),
+            w, h);
+        var screen = PointToScreen(rect.Location);
+
+        _renameBox?.ForceClose();
+
+        var box = new RenameBox(item.Name, new Rectangle(screen, rect.Size), LabelFont);
+        _renameBox = box;
+
+        // 回调里对比引用：期间可能已经弹了另一个编辑框（连续改名）
+        box.Committed += text =>
         {
-            Text = _items[index].Name,
-            BorderStyle = BorderStyle.FixedSingle,
-            Font = LabelFont,
-            Location = r.Location,
-            Size = r.Size,
-            TextAlign = HorizontalAlignment.Center,
+            if (ReferenceEquals(_renameBox, box)) _renameBox = null;
+            if (text.Length > 0) RenameRequested?.Invoke(item, text);
+            Repaint();
         };
-        _editor.KeyDown += (_, e) =>
+        box.Cancelled += () =>
         {
-            if (e.KeyCode == Keys.Enter) { CommitEdit(); e.SuppressKeyPress = true; }
-            else if (e.KeyCode == Keys.Escape) { CancelEdit(); e.SuppressKeyPress = true; }
+            if (ReferenceEquals(_renameBox, box)) _renameBox = null;
+            Repaint();
         };
-        _editor.LostFocus += (_, _) => { if (_editor != null) CommitEdit(); };
-
-        Controls.Add(_editor);
-        _editor.Focus();
-        _editor.SelectAll();
+        box.Show();
     }
 
-    private void CommitEdit()
-    {
-        if (_editor == null) return;
-        var ed = _editor;
-        _editor = null;
-
-        var item = Selected;
-        string text = ed.Text.Trim();
-        Controls.Remove(ed);
-        ed.Dispose();
-
-        if (item != null && text.Length > 0)
-            RenameRequested?.Invoke(item, text);
-
-        Repaint();
-    }
-
-    private void CancelEdit()
-    {
-        if (_editor == null) return;
-        var ed = _editor;
-        _editor = null;
-        Controls.Remove(ed);
-        ed.Dispose();
-        Repaint();
-    }
+    /// <summary>收尾一次进行中的改名（等同回车）。用于「点开了别的东西」这类外部打断。</summary>
+    private void CommitEdit() => _renameBox?.CommitNow();
 
     /// <summary>改名请求（由外层真正执行文件改名）</summary>
     public event Action<DiscoveredItem, string>? RenameRequested;
@@ -1249,7 +1238,7 @@ internal sealed class BoxView : Control
         {
             _fTitle?.Dispose();
             _fLabel?.Dispose();
-            _editor?.Dispose();
+            _renameBox?.ForceClose();
         }
         base.Dispose(disposing);
     }

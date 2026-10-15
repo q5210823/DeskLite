@@ -71,15 +71,30 @@ internal static class ShellMenu
     /// <param name="extras">追加到菜单末尾的自定义项（可为 null）</param>
     /// <param name="extendedVerbs">true = Shift+右键，显示扩展动词（CMF_EXTENDEDVERBS）</param>
     /// <param name="chosenExtra">用户点中的自定义项 id（没点中自定义项则为 0）</param>
+    /// <param name="renameRequested">
+    /// true = 用户点了菜单里的「重命名」。<b>此项不会交给 Shell 执行</b>，见下方说明，
+    /// 由调用方自己发起就地改名。
+    /// </param>
     /// <returns>
     /// true  = 原生菜单已弹出（无论最终选中命令还是按 Esc 取消）；
     /// false = 压根没能建立原生菜单（Shell 拒绝、路径全部无法解析…），调用方应回退到自带菜单。
     /// </returns>
+    /// <remarks>
+    /// <b>关于「重命名」。</b>菜单里的这一项是 Shell 自己加的，条件是 <c>QueryContextMenu</c>
+    /// 带 <see cref="CMF_CANRENAME"/>（explorer 的视图就是这么告诉 shell「我这里能改名」的）——
+    /// 少了这个标志，菜单里就真的没有「重命名」，这正是之前缺项的原因。
+    ///
+    /// 但它**只加项、不管执行**：真正弹出编辑框的是 explorer 的 <c>IShellView</c>。
+    /// 格子里的图标是我们自绘的、没有 shell 视图，把命令原样 <c>InvokeCommand</c> 回去
+    /// 只会静默失败（点了没反应）。所以这里认出来、交给宿主自己处理，
+    /// 菜单长相对用户仍是原生一致的。
+    /// </remarks>
     internal static bool TryShow(IntPtr owner, Point screen, IReadOnlyList<string> paths,
                                 IReadOnlyList<Extra>? extras, bool extendedVerbs,
-                                out int chosenExtra)
+                                out int chosenExtra, out bool renameRequested)
     {
         chosenExtra = 0;
+        renameRequested = false;
         if (paths.Count == 0) return false;
 
         var pidls = new List<IntPtr>(paths.Count);
@@ -102,7 +117,9 @@ internal static class ShellMenu
             hMenu = CreatePopupMenu();
             if (hMenu == IntPtr.Zero) return false;
 
-            uint flags = (extendedVerbs ? CMF_EXTENDEDVERBS : 0u) | CMF_NORMAL;
+            // CMF_CANRENAME 是让 Shell 把「重命名」放进菜单的那个标志；
+            // 不加就没有这一项（没有它菜单只能靠第三方扩展碰运气）。
+            uint flags = CMF_NORMAL | CMF_CANRENAME | (extendedVerbs ? CMF_EXTENDEDVERBS : 0u);
             if (cm.QueryContextMenu(hMenu, 0, IdCmdFirst, 0x7FFF, flags) < 0) return false;
 
             AppendExtras(hMenu, extras);
@@ -128,7 +145,13 @@ internal static class ShellMenu
             }
 
             if (cmd >= ExtraIdBase) chosenExtra = cmd;
-            else if (cmd > 0) Invoke(cm, owner, cmd, screen);
+            else if (cmd > 0)
+            {
+                // 「重命名」交回宿主自己执行 —— Shell 只负责把这一项画出来，
+                // 执行要靠 explorer 的 shell 视图，而我们没有（图标是自绘的）。
+                if (IsRename(cm, cmd - IdCmdFirst)) renameRequested = true;
+                else Invoke(cm, owner, cmd, screen);
+            }
 
             return true;
         }
@@ -152,6 +175,10 @@ internal static class ShellMenu
 
     /// <summary>Shell 菜单标志位</summary>
     private const uint CMF_NORMAL = 0x00000000;
+
+    /// <summary>告诉 Shell「我这里可以重命名」—— 加了它菜单里才会出现「重命名」</summary>
+    private const uint CMF_CANRENAME = 0x00000010;
+
     private const uint CMF_EXTENDEDVERBS = 0x00000100;
 
     private const uint MF_STRING = 0x00000000;
@@ -231,6 +258,10 @@ internal static class ShellMenu
 
     /// <summary>QueryContextMenu 的第一个命令 id（=1）。InvokeCommand 只认「相对偏移」，所以要减掉它。</summary>
     private const int IdCmdFirst = 1;
+
+    /// <summary>这一条是不是 Shell 的「重命名」（规范动词名固定为 rename，与语言无关）</summary>
+    private static bool IsRename(IContextMenu cm, int offset)
+        => string.Equals(VerbOf(cm, offset), "rename", StringComparison.OrdinalIgnoreCase);
 
     private static void Invoke(IContextMenu cm, IntPtr owner, int cmd, Point screen)
     {

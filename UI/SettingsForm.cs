@@ -29,6 +29,12 @@ internal sealed class SettingsForm : Form
     private const int TabH = 42;
     private const int FooterH = 78;
 
+    /// <summary>页面内容与底部按钮栏之间留的呼吸距离</summary>
+    private const int PagePad = 14;
+
+    /// <summary>三页里最高那一页的内容底部（绝对定位算出来的），用来定窗口高度</summary>
+    private int _pageBottom;
+
     private readonly AppSettings _work;
     private readonly Action<AppSettings> _onApply;
 
@@ -81,6 +87,12 @@ internal sealed class SettingsForm : Form
         BuildDeskPage();
         BuildMenuPage();
         LoadFromSettings();
+
+        // 三页的内容全是绝对定位。窗口高度直接取「最高的一页 + 一点余量」——
+        // 于是既不会出现「最后一段说明被裁掉」，也不会冒出横竖滚动条。
+        // 以后往页面里加两行也无需再去手调窗体尺寸。
+        Height = HeaderH + TabH + FooterH + _pageBottom + PagePad;
+
         ShowPage(Math.Clamp(initialPage, 0, 2));
 
         KeyDown += (_, e) => { if (e.KeyCode == Keys.Escape) Close(); };
@@ -92,7 +104,6 @@ internal sealed class SettingsForm : Form
     {
         var bar = new Panel { Dock = DockStyle.Top, Height = HeaderH, BackColor = BarBg };
         bar.MouseDown += DragStart;
-        bar.MouseMove += DragMove;
 
         var title = new Label
         {
@@ -105,7 +116,6 @@ internal sealed class SettingsForm : Form
             Size = new Size(200, HeaderH),
         };
         title.MouseDown += DragStart;
-        title.MouseMove += DragMove;
 
         var sub = new Label
         {
@@ -117,6 +127,7 @@ internal sealed class SettingsForm : Form
             Location = new Point(74, 1),
             Size = new Size(220, HeaderH),
         };
+        sub.MouseDown += DragStart;   // 副标题压在标题右侧，不绑的话那段拖不动
 
         var close = new Button
         {
@@ -286,9 +297,14 @@ internal sealed class SettingsForm : Form
 
         AddDivider(p, 28, y, 544);
         y += 12;
+
+        // 这段说明按「显式三行」写：之前靠自动换行，字长一超就被 Label 裁掉最后一行，
+        // 看着就像「选项没显示全」。宽度给足、行数说清，不再依赖换行结果。
         AddSub(p, "精简版去掉：魔镜壁纸 / 挂件、云与 AI（一键上云、AI 问答、AI 便签）、\n" +
-                   "内嵌内容（CEF 浏览器、TBS、下载中心）。保留：格子分类规则、类型码、\n" +
-                   "序列化格式与滚动备份策略。", 28, y, 544, 3);
+                   "内嵌内容（CEF 浏览器、TBS、下载中心）。\n" +
+                   "保留：格子分类规则、类型码、序列化格式与滚动备份策略。",
+            28, y, 544, 3);
+        NotePage(y + 54);
 
         _host.Controls.Add(p);
         _pages[0] = p;
@@ -343,6 +359,7 @@ internal sealed class SettingsForm : Form
         y += 40;
         AddSub(p, "格式示例：Ctrl+Alt+S、Ctrl+Shift+Space、Win+D。留空表示不注册全局热键。\n" +
                    "保存后立即生效；若已被其他程序占用，会在托盘提示。", 28, y, 544, 2);
+        NotePage(y + 38);
 
         _host.Controls.Add(p);
         _pages[1] = p;
@@ -396,7 +413,9 @@ internal sealed class SettingsForm : Form
         p.Controls.Add(bRestart);
 
         AddSub(p, "注册表方式（HKCU，无需管理员、不注入 explorer）；卸载即删键可完全回滚。\n" +
-                   "Win11 上菜单位于「显示更多选项」；切换菜单风格后需重启资源管理器生效。", 28, y + 44, 544, 2);
+                   "Win11 上菜单位于「显示更多选项」；切换菜单风格后需重启资源管理器生效。",
+            28, y + 44, 544, 2);
+        NotePage(y + 44 + 38);
 
         _host.Controls.Add(p);
         _pages[2] = p;
@@ -575,8 +594,11 @@ internal sealed class SettingsForm : Form
     // ═══════════════ 布局小工具 ═══════════════
 
     /// <summary>
-    /// 新建一页。开启 AutoScroll：页面内容是绝对定位的，一旦加了几行说明就可能超出高度，
-    /// 有了滚动条至少不会「悄悄把最后一段文字裁掉」。
+    /// 新建一页。
+    ///
+    /// **刻意不开 AutoScroll**：滚动条在这个尺寸的设置面板里既难看又没用武之地
+    /// （一旦出现，说明窗口本来就该长高）。真正的解法是让窗口按内容自适应 ——
+    /// 见构造函数里用 <see cref="NotePage"/> 收上来的高度。
     /// </summary>
     private Panel NewPage()
     {
@@ -585,8 +607,14 @@ internal sealed class SettingsForm : Form
             Dock = DockStyle.Fill,
             BackColor = Bg,
             Visible = false,
-            AutoScroll = true,
+            AutoScroll = false,
         };
+    }
+
+    /// <summary>报告某一页的内容底部（含最后一行文字的实际高度），窗口取三页里的最大值</summary>
+    private void NotePage(int bottom)
+    {
+        if (bottom > _pageBottom) _pageBottom = bottom;
     }
 
     private static Label AddLabel(Control host, string text, int x, int y, int w = 130)
@@ -695,35 +723,34 @@ internal sealed class SettingsForm : Form
     }
 
     // ── 拖动窗口 ──
-    private bool _drag;
-    private Point _dragCursor, _dragOrigin;
-
+    //
+    // 早先的写法是自己记 Location 跟着鼠标算（MouseDown 置标志 + MouseMove 挪窗口）。
+    // 它有一个很隐蔽的缺陷：复位标志靠的是窗体的 MouseUp，而**鼠标在窗口外松手时
+    // 窗体根本收不到这个事件**（拖快一点就必然发生）——标志于是永远停在「正在拖动」，
+    // 此后鼠标不按键、只是经过标题栏，整个窗口就跟着鼠标飘。
+    //
+    // 现在改为把这次按下交给系统的标题栏拖动：系统负责捕获鼠标、负责结束，
+    // 没有任何状态残留在我们这边。
     private void DragStart(object? sender, MouseEventArgs e)
     {
         if (e.Button != MouseButtons.Left) return;
-        _drag = true;
-        _dragCursor = Cursor.Position;
-        _dragOrigin = Location;
-    }
-
-    private void DragMove(object? sender, MouseEventArgs e)
-    {
-        if (!_drag) return;
-        var cur = Cursor.Position;
-        Location = new Point(_dragOrigin.X + cur.X - _dragCursor.X, _dragOrigin.Y + cur.Y - _dragCursor.Y);
-    }
-
-    protected override void OnMouseUp(MouseEventArgs e)
-    {
-        base.OnMouseUp(e);
-        _drag = false;
+        try
+        {
+            Win32.Native.ReleaseCapture();
+            Win32.Native.SendMessage(Handle, Win32.Native.WM_NCLBUTTONDOWN,
+                (IntPtr)Win32.Native.HTCAPTION, IntPtr.Zero);
+        }
+        catch { /* 拖动失败不影响窗口本身 */ }
     }
 
     protected override void OnShown(EventArgs e)
     {
         base.OnShown(e);
-        // 避免首个下拉框一打开就处于「选中高亮」状态，影响观感
-        ActiveControl = null;
+
+        // 下拉框一旦拿到焦点，DropDownList 会把选中项画成系统高亮的亮蓝色块，
+        // 打开设置第一眼就像是「已经选中/被框住」。把初始焦点交给没有高亮的轨道条。
+        ActiveControl = _tbGlass;
+
         RefreshMemoryLabel();
 
         // 窗口开着的时候让「运行占用」自己刷 —— 用户点进设置就是想看这个数，

@@ -277,6 +277,16 @@ internal static class Native
     public static extern IntPtr SendMessage(IntPtr hWnd, int Msg, IntPtr wParam, IntPtr lParam);
 
     [DllImport("user32.dll")]
+    public static extern bool ReleaseCapture();
+
+    [DllImport("user32.dll")]
+    public static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    /// <summary>把一次鼠标按下伪装成「按在非客户区标题栏上」，交给系统的窗口拖动去处理</summary>
+    public const int WM_NCLBUTTONDOWN = 0x00A1;
+    public const int HTCAPTION = 2;
+
+    [DllImport("user32.dll")]
     public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 
     [DllImport("user32.dll")]

@@ -1082,7 +1082,21 @@ internal sealed class BoxForm : Form
         // 按住 Shift 右键 → 扩展动词（与资源管理器一致）
         bool extended = (ModifierKeys & Keys.Shift) != 0;
 
-        return ShellMenu.TryShow(Handle, screenPoint, paths, null, extended, out _);
+        if (!ShellMenu.TryShow(Handle, screenPoint, paths, null, extended,
+                               out _, out bool rename))
+            return false;
+
+        // 菜单里的「重命名」是 Shell 画上去的（靠 CMF_CANRENAME），但**它执行不了**：
+        // 真正弹编辑框的是 explorer 的 shell 视图，格子里的图标是我们自绘的、没有这个东西。
+        // 原样 InvokeCommand 回去的结果就是「点了没反应」。所以这里换成我们自己的就地改名。
+        // 排到消息队列稍后一点：此刻 TrackPopupMenuEx 的模态循环刚退出，
+        // 立刻抢焦点有可能被它收尾时的 SetFocus 顶掉。
+        if (rename)
+        {
+            try { BeginInvoke(new Action(() => _view.BeginRenameSelected())); }
+            catch { _view.BeginRenameSelected(); }
+        }
+        return true;
     }
 
     /// <summary>在资源管理器中定位当前项（选中态），虚拟项 / 多项选择都不可用</summary>
