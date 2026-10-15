@@ -1,0 +1,22 @@
+# ── 构建产物 ──
+bin/
+obj/
+*.user
+*.suo
+
+# ── 运行产物（由 dotnet build 生成；本仓库只托管源码）──
+/DeskLite.exe
+/DeskLite.dll
+/DeskLite.pdb
+/DeskLite.deps.json
+/DeskLite.runtimeconfig.json
+
+# ── 诊断命令的输出（临时文件）──
+*-result.txt
+memprobe.txt
+*.log
+
+# ── 系统 / 运行时残留 ──
+Thumbs.db
+Desktop.ini
+desktop_hidden.lock

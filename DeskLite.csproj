@@ -1,0 +1,63 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net7.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>DeskLite</AssemblyName>
+    <RootNamespace>DeskLite</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <!-- 应用图标：exe / 资源管理器 / 任务栏 用 Resources\app.ico（9 档） -->
+    <ApplicationIcon>Resources\app.ico</ApplicationIcon>
+    <Version>1.0.0</Version>
+    <Product>桌面整理 · 精简版</Product>
+    <Description>DeskGo 精简复刻：格子整理 + 搜索，无壁纸/云/AI/内容模块</Description>
+    <!-- 轻量化：框架依赖模式，产物仅数百 KB，复用系统已有 .NET 运行时 -->
+    <SelfContained>false</SelfContained>
+    <SatelliteResourceLanguages>zh-Hans;en</SatelliteResourceLanguages>
+    <EnableDefaultCompileItems>true</EnableDefaultCompileItems>
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
+
+    <!-- ── 「小而轻」相关开关 ──
+         1) InvariantGlobalization：不加载 ICU 全球化数据（实测能省下二十多 MB 工作集）。
+            本程序不做区域相关的排序/格式化，汉字→拼音走 GB2312 编码表（CodePages，独立于 ICU），
+            因此开启后功能不受影响。
+         2) EventSourceSupport：关掉 EventSource/EventPipe 事件通道，少一组常驻元数据。
+         3) TieredPGO / TieredCompilation：保持默认（首次启动更快、常驻内存更低）。-->
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <EventSourceSupport>false</EventSourceSupport>
+
+    <!-- ── 进一步压低常驻内存的三个运行时开关（.NET 7 支持）──
+         1) System.GC.ConserveMemory=9：让 GC 更激进地把空闲代段解提交还给系统。
+            本程序是「启动时忙一阵、之后长期空闲」的形态，托管堆峰值 6 MB、存活仅 1 MB，
+            默认策略会把已提交的段留着不用；调到 9 之后空闲段会被真正交还。
+         2) System.GC.Concurrent=false：关掉后台 GC 线程及其辅助结构（少一个常驻线程 +
+            一套标记用的数据结构）。本程序分配量极小、停顿无感，不需要并发 GC。
+         3) System.GC.RetainVM=false：GC 释放的段直接交还 OS，而不是留在虚拟内存里备用。 -->
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <RetainVMGarbageCollection>false</RetainVMGarbageCollection>
+
+    <!-- ── 再压一档常驻（都不影响功能）──
+         1) TieredPGO：按实际执行路径优化 JIT 后的代码，稳态更小更快。
+         2) UseSystemResourceKeys=true：不打包框架异常消息资源（省约 1 MB 工作集）。
+            代价是异常信息会变成键名，调试时靠文档对照 —— 常驻托盘程序可以接受。
+         3) MetadataUpdaterSupport=false：关掉「运行时元数据热更新」这套结构。 -->
+    <TieredPGO>true</TieredPGO>
+    <UseSystemResourceKeys>true</UseSystemResourceKeys>
+    <MetadataUpdaterSupport>false</MetadataUpdaterSupport>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <RuntimeHostConfigurationOption Include="System.GC.ConserveMemory" Value="9" />
+  </ItemGroup>
+
+  <!-- 托盘小图标（16/20/24/32 四档，约 5KB）：嵌入托管资源，运行时直接读流，不碰 shell -->
+  <ItemGroup>
+    <EmbeddedResource Include="Resources\app-tray.ico" />
+  </ItemGroup>
+
+</Project>
