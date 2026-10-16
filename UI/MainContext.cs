@@ -190,6 +190,11 @@ internal sealed class MainContext : ApplicationContext, IBoxSnapper
         StartWatcher();
         StartKeepAlive();
         ApplyHotkey();
+
+        // 接「注销 / 关机」广播的消息窗（只占一个 HWND，见 SessionWatcher 的说明）
+        _sessionWatcher = new SessionWatcher();
+        _sessionWatcher.Start();
+
         Mark("变更监听 + 保活 + 热键");
 
         ScheduleStartupSettle();
@@ -1432,8 +1437,9 @@ internal sealed class MainContext : ApplicationContext, IBoxSnapper
     //
     // 设计原则：**空闲时才整理，忙的时候绝不插手**。
     // 反复地 GC + TrimWorkingSet 会把正在用的页面丢掉再换入，反而更慢更费 CPU；
-    // 所以这里用「静默 4 秒 + 冷却 30 秒 + 低于水位线不动」三道闸门把它约束住，
+    // 所以这里用「静默 4 秒 + 自适应冷却 + 低于水位线不动」三道闸门把它约束住，
     // 用户平时根本感知不到，而常驻占用始终贴着下限。
+    // 冷却按水位分两档（6s / 30s），另加「无效退避」防止 trim 徒劳时反复折腾。
 
     /// <summary>最近一次「有实质动作」的时刻（Environment.TickCount64，毫秒）</summary>
     private long _lastActivity;
@@ -1443,18 +1449,57 @@ internal sealed class MainContext : ApplicationContext, IBoxSnapper
 
     private long _lastSettleTick;
     private System.Windows.Forms.Timer? _idleTimer;
+    private SessionWatcher? _sessionWatcher;
 
-    private const long IdleAfterMs = 4_000;        // 静默多久算「空闲」
-    private const long SettleCooldownMs = 30_000;  // 两次整理之间的最小间隔
-    private const long SettleMaxIdleMs = 180_000;  // 一直空闲时，至多每 3 分钟补一次
-    private const long LowWaterBytes = 26L * 1024 * 1024;   // 工作集低于此值就别折腾了
-    private const int IdlePollMs = 5_000;          // 巡检间隔（一次计数器读取，开销可忽略）
+    /// <summary>
+    /// 「整理没效果」时的退避间隔。上一次 GC+Trim 之后工作集几乎没降，
+    /// 说明那些页面是真在用的 —— 再频繁整理只会和系统页调度互相拉扯，
+    /// 于是逐步拉长间隔（8s → 16s → 32s → 60s 封顶）。只要有一次明显下降就归零。
+    /// </summary>
+    private long _settleBackoffMs;
 
-    /// <summary>记一次「活动」：推迟下一次整理，并标记为「有垃圾可回收」</summary>
+    private const long IdleAfterMs = 4_000;             // 静默多久算「空闲」
+    private const long SettleCooldownMs = 30_000;       // 已贴近水位线时的整理间隔（没必要勤动）
+    private const long SettleBurstCooldownMs = 6_000;   // 水位明显偏高时的快速回落间隔
+    private const long SettleMaxIdleMs = 180_000;       // 一直空闲时，至多每 3 分钟补一次
+
+    /// <summary>
+    /// 「已经够小了、不必再折腾」的水位线。
+    ///
+    /// 这个值必须和**活动后的水位**拉开距离：一次桌面刷新会把工作集推到 24~36 MB，
+    /// 而稳定态只有 10~11 MB。早先取 26 MB 时，活动刚过去的水位（24~26 MB）恰好
+    /// 落在「低水位」区间里 —— 于是每次巡检都走「不用管」分支，而那个分支又会刷新
+    /// 冷却计时，结果整理被无限期推后（实测出现过 22 秒不回落）。
+    /// 取 16 MB：稳定态稳稳低于它，活动态稳稳高于它，两边都不含糊。
+    /// </summary>
+    private const long LowWaterBytes = 16L * 1024 * 1024;
+    private const long SettleEffectBytes = 2L * 1024 * 1024; // 一次整理降幅小于此值视为「没效果」
+    private const long SettleBackoffMs = 8_000;         // 无效退避起点
+    private const long SettleBackoffMaxMs = 60_000;     // 无效退避上限
+
+    /// <summary>
+    /// 巡检间隔。**分两档是刻意的**：刚忙完时用快速档尽快回落，稳定下来就切回慢速档。
+    /// 一直用 2 秒会让常驻 CPU 从 0.00x% 抬到 0.04% 左右（定时器唤醒频率 ×2.5），
+    /// 而长期空闲时根本没必要这么勤 —— 那点成本换不回落速度的任何收益。
+    /// </summary>
+    private const int IdlePollFastMs = 2_000;           // 刚活动过：加密巡检
+    private const int IdlePollSlowMs = 5_000;           // 已稳定：稀一点，省唤醒
+
+    /// <summary>记一次「活动」：推迟下一次整理，标记为「有垃圾可回收」，并切到快速巡检</summary>
     private void NoteActivity()
     {
         _lastActivity = Environment.TickCount64;
         _memDirty = true;
+        SetIdlePoll(IdlePollFastMs);
+    }
+
+    /// <summary>切换空闲巡检频率（值没变时不做任何事，避免无谓的定时器重启）</summary>
+    private void SetIdlePoll(int ms)
+    {
+        if (_idleTimer == null || _idleTimer.Interval == ms) return;
+        _idleTimer.Stop();
+        _idleTimer.Interval = ms;
+        _idleTimer.Start();
     }
 
     /// <summary>
@@ -1477,6 +1522,7 @@ internal sealed class MainContext : ApplicationContext, IBoxSnapper
             SettleMemory(full: true);
             _lastSettleTick = Environment.TickCount64;
             _memDirty = false;
+            _settleBackoffMs = 0;      // 启动整理必定有效，清空退避
 
             // 之后交给空闲巡检常驻维持
             StartIdleSettle();
@@ -1487,32 +1533,67 @@ internal sealed class MainContext : ApplicationContext, IBoxSnapper
     private void StartIdleSettle()
     {
         if (_idleTimer != null) return;
-        _idleTimer = new System.Windows.Forms.Timer { Interval = IdlePollMs };
+        _idleTimer = new System.Windows.Forms.Timer { Interval = IdlePollSlowMs };
         _idleTimer.Tick += (_, _) => TryIdleSettle();
         _idleTimer.Start();
     }
 
-    /// <summary>空闲巡检：三道闸门都过了才动手</summary>
+    /// <summary>
+    /// 空闲巡检：三道闸门都过了才动手。
+    ///
+    /// 冷却时间是<b>自适应</b>的（这是本方法与旧版的唯一差别）：
+    ///   · 水位高于 <see cref="LowWaterBytes"/> → 用 6 秒短冷却，尽快落回去；
+    ///   · 已经贴着下限 → 用 30 秒长冷却，纯粹没必要动它。
+    /// 配合 2 秒的巡检间隔，最坏情况下的回落延迟从 39 秒降到约 12 秒
+    /// （旧版是 4s 静默 + 最多 5s 轮询 + 固定 30s 冷却）。
+    /// 再加一层「无效退避」：若某次整理后水位几乎没降，说明那些页面真在用，
+    /// 就逐步拉长间隔，避免与系统页调度互相拉扯 —— 那才是真的费 CPU。
+    /// </summary>
     private void TryIdleSettle()
     {
         long now = Environment.TickCount64;
 
-        if (now - _lastActivity < IdleAfterMs) return;              // ① 还在忙
-        if (now - _lastSettleTick < SettleCooldownMs) return;       // ② 冷却未过
-        if (!_memDirty && now - _lastSettleTick < SettleMaxIdleMs) return;   // ③ 没垃圾就不用管
+        if (now - _lastActivity < IdleAfterMs) return;      // ① 还在忙（连计数器都不用读）
 
         var (ws, _) = MemInfo.Counters();
-        if (ws > 0 && ws < LowWaterBytes)
+        if (ws <= 0) return;                                 // 读不到就下次再说
+
+        // ② 冷却：按当前水位选档，再让退避值兜底
+        long cooldown = ws > LowWaterBytes ? SettleBurstCooldownMs : SettleCooldownMs;
+        if (_settleBackoffMs > cooldown) cooldown = _settleBackoffMs;
+        if (now - _lastSettleTick < cooldown) return;
+
+        if (!_memDirty && now - _lastSettleTick < SettleMaxIdleMs) return;   // ③ 没垃圾就不用管
+
+        if (ws <= LowWaterBytes)
         {
-            // 已经很小了：再 trim 只会制造缺页，不划算
-            _lastSettleTick = now;
+            // 已经很小了：再 trim 只会制造缺页，不划算。
+            //
+            // 注意这里**刻意不动 `_lastSettleTick`**：这个分支什么都没做，
+            // 如果顺手把冷却计时清零，稳定期的每 5 秒巡检就会把冷却一直推后，
+            // 等到真需要整理时反而被卡住（这正是「改尺寸后 20 多秒不回落」的成因）。
+            // 冷却只应该由**真正做过整理**的那次来重置。
             _memDirty = false;
+            SetIdlePoll(IdlePollSlowMs);      // 稳定了，巡检放稀，省唤醒
             return;
         }
 
         SettleMemory(full: false);
         _lastSettleTick = now;
         _memDirty = false;
+
+        // 量一下这次到底值不值：降幅够大就清空退避，否则指数拉长下一次的间隔
+        var (after, _) = MemInfo.Counters();
+        bool effective = after <= 0 || ws - after >= SettleEffectBytes;
+        _settleBackoffMs = effective
+            ? 0
+            : (_settleBackoffMs == 0
+                ? SettleBackoffMs
+                : Math.Min(_settleBackoffMs * 2, SettleBackoffMaxMs));
+
+        // 已经落回低水位 → 巡检放稀；还没落下来则保持快速档，继续等下一次
+        if (effective && after > 0 && after <= LowWaterBytes)
+            SetIdlePoll(IdlePollSlowMs);
     }
 
     /// <summary>
@@ -1651,6 +1732,7 @@ internal sealed class MainContext : ApplicationContext, IBoxSnapper
     {
         try { _idleTimer?.Stop(); _idleTimer?.Dispose(); } catch { }
         try { _keepAlive?.Stop(); _keepAlive?.Dispose(); } catch { }
+        try { _sessionWatcher?.Stop(); _sessionWatcher = null; } catch { }
         try { StopWatchers(); } catch { }
         try { _bus.Dispose(); } catch { }
 
@@ -1684,5 +1766,47 @@ internal sealed class MainContext : ApplicationContext, IBoxSnapper
         if (!ReferenceEquals(_trayIcon, SystemIcons.Application)) _trayIcon.Dispose();
 
         ExitThread();
+    }
+
+    /// <summary>
+    /// 只为收「注销 / 关机」广播而存在的隐藏消息窗。
+    ///
+    /// <b>为什么需要它</b>：格子被 <c>SetParent</c> 到 Progman 之后是**子窗口**，
+    /// 而 <c>WM_ENDSESSION</c> 只广播给顶层窗口 —— 指望格子来接是接不到的。
+    /// 系统在会话真正结束前给的这个通知，是我们在被强杀之前最后一次能把
+    /// 桌面原生图标还回去的机会；错过它，关机画面期间用户看到的就是空桌面。
+    ///
+    /// <b>为什么不用 <c>SystemEvents.SessionEnding</c></b>：它会在进程里常驻一个
+    /// 系统事件线程 + 一个隐藏窗口，只为换来同一件事。这里用 <see cref="NativeWindow"/>
+    /// 直接建一个不可见顶层窗口，代价只有一个 HWND：没有额外线程、也没有窗体设施。
+    /// </summary>
+    private sealed class SessionWatcher : NativeWindow
+    {
+        public void Start()
+        {
+            CreateHandle(new CreateParams
+            {
+                ClassName = "STATIC",              // 系统预注册类，省掉自己注册窗口类
+                Caption = "DeskLite.SessionWatcher",
+                Style = 0,                          // 不含 WS_VISIBLE：不会显示出来
+                ExStyle = 0,
+                X = 0, Y = 0, Width = 0, Height = 0,
+            });
+        }
+
+        public void Stop()
+        {
+            try { DestroyHandle(); } catch { /* 正在退出，句柄可能已经没了 */ }
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            // wParam != 0 才是「会话确实要结束了」；0 只是查询阶段，不该动手
+            if (m.Msg == Win32.Native.WM_ENDSESSION && m.WParam != IntPtr.Zero)
+            {
+                try { CrashGuard.EmergencyExit(); } catch { }
+            }
+            base.WndProc(ref m);
+        }
     }
 }

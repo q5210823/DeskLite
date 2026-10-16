@@ -1,4 +1,3 @@
-using System.Drawing.Drawing2D;
 using DeskLite.Core;
 
 namespace DeskLite.UI;
@@ -51,6 +50,9 @@ internal sealed class SettingsForm : Form
 
     /// <summary>「运行占用」的自动刷新定时器（仅在窗口打开期间运行）</summary>
     private System.Windows.Forms.Timer? _memTimer;
+
+    /// <summary>当前装在窗口上的圆角 Region（见 <see cref="Shapes.ApplyRoundedRegion"/>）</summary>
+    private Region? _frameRegion;
 
     // 桌面页
     private CheckBox _chkTakeover = null!, _chkEmbed = null!, _chkCollapse = null!, _chkDbl = null!;
@@ -769,6 +771,10 @@ internal sealed class SettingsForm : Form
         {
             try { _memTimer?.Stop(); _memTimer?.Dispose(); } catch { }
             _memTimer = null;
+
+            // 窗口自己不会释放赋给 Region 属性的 GDI 对象，得由我们收尾
+            _frameRegion?.Dispose();
+            _frameRegion = null;
         }
         base.Dispose(disposing);
     }
@@ -776,14 +782,7 @@ internal sealed class SettingsForm : Form
     protected override void OnResize(EventArgs e)
     {
         base.OnResize(e);
-        using var path = new GraphicsPath();
-        int d = 24;
-        var r = new Rectangle(0, 0, Width, Height);
-        path.AddArc(r.X, r.Y, d, d, 180, 90);
-        path.AddArc(r.Right - d, r.Y, d, d, 270, 90);
-        path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
-        path.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
-        path.CloseFigure();
-        Region = new Region(path);
+        // 见 Shapes.ApplyRoundedRegion：必须复用同一个 holder，否则每次改尺寸漏一个 GDI Region
+        Shapes.ApplyRoundedRegion(this, 12, ref _frameRegion);
     }
 }

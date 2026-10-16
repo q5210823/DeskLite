@@ -46,6 +46,13 @@ internal sealed class BoxForm : Form
     private readonly ContextMenuStrip _itemMenu;
     private readonly ContextMenuStrip _boxMenu;
 
+    /// <summary>
+    /// 当前装在窗口上的圆角 Region（仅回退路径 <see cref="LayerDisabled"/> 下非空）。
+    /// 自己持有并在替换 / 销毁时释放 —— <c>Control.Region</c> 的 setter 不接管所有权，
+    /// 见 <see cref="Shapes.ApplyRoundedRegion"/> 的说明。
+    /// </summary>
+    private Region? _frameRegion;
+
     /// <summary>布局追踪开关（与 MainContext.TraceLayout 同一个环境变量）</summary>
     private static readonly bool TraceLayout =
         Environment.GetEnvironmentVariable("DESKLITE_TRACE_LAYOUT") == "1";
@@ -640,7 +647,14 @@ internal sealed class BoxForm : Form
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing) ReleaseBuffers(keepBitmap: false);
+        if (disposing)
+        {
+            ReleaseBuffers(keepBitmap: false);
+
+            // 窗口自己不会释放赋给 Region 属性的 GDI 对象，得由我们收尾
+            _frameRegion?.Dispose();
+            _frameRegion = null;
+        }
         base.Dispose(disposing);
     }
 
@@ -716,18 +730,14 @@ internal sealed class BoxForm : Form
     {
         base.OnResize(e);
 
-        if (LayerDisabled)
-        {
-            // 回退路径：形状只能靠窗口 Region 裁
-            using var path = Shapes.RoundedPath(new Rectangle(0, 0, Width, Height), CornerRadius);
-            Region = new Region(path);
-        }
-        else if (Region != null)
-        {
-            // 分层窗口自带「按 alpha 通道做命中测试」，圆角已经是透明的，
-            // 再套一层 Region 等于裁两遍，而且部分系统上会让分层内容整块不显示。
-            Region = null;
-        }
+        // 回退路径（LayerDisabled）形状只能靠窗口 Region 裁；
+        // 分层窗口自带「按 alpha 通道做命中测试」，圆角本来就是透明的，
+        // 再套一层 Region 等于裁两遍，而且部分系统上会让分层内容整块不显示。
+        //
+        // 两种分支都走 helper：它会把上一次装上去的 Region 释放掉。
+        // 直接写 Region = new Region(path) 会每次 OnResize 漏一个 GDI 对象 —— 而
+        // 拖动改尺寸一次就触发几十次 WM_SIZE，是用户最容易反复做的动作。
+        Shapes.ApplyRoundedRegion(this, LayerDisabled ? CornerRadius : 0, ref _frameRegion);
 
         // 尺寸变了要重画（ICB 位图尺寸也跟着变）
         LogLife("OnResize/前");

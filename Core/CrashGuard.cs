@@ -15,15 +15,24 @@ namespace DeskLite.Core;
 /// ── 三层防护（互为兜底，任一层生效即可避免图标丢失）──
 ///   ① <b>全局异常兜底</b>
 ///      · UI 线程异常 → 记日志后**继续运行**（托盘程序不该被一次 UI 异常带走）；
-///      · 后台线程 / 终结器线程异常 → 进程一定会结束，但结束前先把桌面还原。
+///      · 后台线程 / 终结器线程异常 → 进程一定会结束，但结束前先把桌面还原；
+///      · <b>进程退出回调</b>（<c>ProcessExit</c> / <c>SessionEnding</c>）→ 覆盖
+///        Control-C、控制台关闭、注销、关机等「不走我们的退出流程」的终止路径。
 ///   ② <b>落盘标记自愈</b>
 ///      隐藏桌面时写 <c>desktop_hidden.lock</c>，正常恢复时删掉它。
 ///      下次启动若发现标记还在，说明上次没走完清理流程 → 启动第一件事就是无条件还原。
-///   ③ <b>兜底命令</b>
-///      <c>DeskLite.exe --restore</c> 不依赖任何进程内状态，随时可手动救回桌面。
+///   ③ <b>兜底命令 + 桌面右键救援</b>
+///      <c>DeskLite.exe --restore</c> 不依赖任何进程内状态，随时可手动救回桌面；
+///      桌面空白处右键的「桌面整理 · 精简版」级联菜单里也有这一项 ——
+///      它活在注册表里，<b>进程死了照样能用</b>，这是唯一能在强杀后自助恢复的入口。
 ///
-/// 说明：所有方法都必须能在「进程正在死」的糟糕时机被调用，因此一律不抛异常、
-/// 不依赖 MainContext / 窗体等可能已经释放的对象，只做最必要的文件与 Win32 调用。
+/// ── 已知限制 ──
+/// 「任务管理器 → 结束任务」这种 <c>TerminateProcess</c> 强杀<b>不可能</b>被进程自己感知，
+/// 内核不会给被杀进程任何执行机会（挂多少个处理器都一样）。要覆盖它只有两条路：
+/// 引入第二个常驻看门狗进程、把桌面图标改成「遮挡」而非「隐藏」——
+/// 前者与本程序「只跑一个进程」的定位冲突，后者要求格子铺满整屏才成立。
+/// 因此这里选择「把恢复入口做到触手可及」：桌面右键 / 重新启动一次程序 / 重启 explorer
+/// 三条路任一都能救回，而不是为此常驻一个进程。
 /// </summary>
 internal static class CrashGuard
 {
@@ -65,12 +74,44 @@ internal static class CrashGuard
         AppDomain.CurrentDomain.UnhandledException += (_, e) =>
             OnFatal(e.ExceptionObject as Exception, e.IsTerminating);
 
+        // 进程正常终止的**最后一道托管回调**。覆盖范围比 MainContext.ExitApp 广得多：
+        // Environment.Exit、控制台被关、Control-C、应用域卸载… 只要进程还愿意跑
+        // 一次托管代码，这里就会执行。Setup 只做最必要的 Win32 调用，不碰任何窗体。
+        AppDomain.CurrentDomain.ProcessExit += (_, _) => EmergencyExit();
+
+        // 注销 / 关机 / 重启：由 MainContext 里那个零成本的隐藏消息窗接
+        // WM_ENDSESSION，然后转到这里（见 EmergencyExit）。
+        //
+        // 刻意**不用** Microsoft.Win32.SystemEvents.SessionEnding：它会在进程里
+        // 常驻一个系统事件线程 + 一个隐藏窗口，只为换来同一件事 ——
+        // 对「常驻内存要贴着地板」的本程序不划算。一个 NativeWindow 就能办到。
+
         // 未观察的 Task 异常：记一笔就好，不要让它升级成进程级错误。
         TaskScheduler.UnobservedTaskException += (_, e) =>
         {
             Log(e.Exception, "TaskScheduler.UnobservedTaskException");
             e.SetObserved();
         };
+    }
+
+    /// <summary>
+    /// 进程正在退出的最后兜底：把桌面原生图标还回去。
+    ///
+    /// 由 <c>ProcessExit</c> 与 <c>WM_ENDSESSION</c> 两处调用。
+    /// 刻意只做两件事（ShowWindow + 删标记），因为这两条路径都有时间预算，
+    /// 超时会被系统直接砍掉；这里也**不抛异常、不引用任何窗体 / MainContext**，
+    /// 避免回调本身把进程弄崩。
+    /// </summary>
+    internal static void EmergencyExit()
+    {
+        try
+        {
+            if (!DesktopMarkedHidden) return;
+            if (EmergencyRestoreDesktop())
+                LogText("进程退出兜底：已还原桌面原生图标（ProcessExit / SessionEnding）。");
+            MarkDesktopShown();
+        }
+        catch { }
     }
 
     /// <summary>

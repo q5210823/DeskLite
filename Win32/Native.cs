@@ -284,6 +284,13 @@ internal static class Native
 
     /// <summary>把一次鼠标按下伪装成「按在非客户区标题栏上」，交给系统的窗口拖动去处理</summary>
     public const int WM_NCLBUTTONDOWN = 0x00A1;
+
+    /// <summary>
+    /// 会话结束（注销 / 关机 / 重启）。系统会把它**广播给所有顶层窗口**，
+    /// wParam != 0 表示会话确实要结束了。这是我们在进程被系统强杀前
+    /// 最后一次能把桌面图标还回去的机会（见 <c>MainContext.SessionWatcher</c>）。
+    /// </summary>
+    public const int WM_ENDSESSION = 0x0016;
     public const int HTCAPTION = 2;
 
     [DllImport("user32.dll")]

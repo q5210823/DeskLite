@@ -122,6 +122,114 @@ internal static class Diagnostics
         Application.Run();
     }
 
+    // ─────────────────── 圆角 Region 成本量化（--gdiresize）───────────────────
+
+    /// <summary>
+    /// 圆角 Region 的成本量化探针。
+    ///
+    /// 背景：三个自绘窗口（格子 / 设置 / 搜索）的圆角都靠 <c>Control.Region</c> 实现。
+    /// 旧写法 <c>Region = new Region(path)</c> 挂在 <c>OnResize</c> 上，每改一次尺寸就
+    /// 造一个新的 Region，而 <c>Control.Region</c> 的 setter 不接管所有权、旧的不会被释放。
+    ///
+    /// <b>注意这不是「GDI 句柄泄漏」</b>：<c>System.Drawing.Region</c> 底层是 GDI+ 的
+    /// <c>GpRegion</c>，不计入 GDI 句柄表（<c>GetGuiResources</c> 看不见），
+    /// 而且它有终结器兜底 —— 真实表现是「非托管内存被推高、且 GDI+ 私有堆水位不回落」。
+    /// 所以本探针同时量 GDI 句柄（应恒定）、私有内存与托管堆。
+    ///
+    /// 还必须拿一个 <b>OnResize 什么都不做的裸窗口</b>做对照：单单改窗口尺寸本身
+    /// （SetWindowPos / 重排 / 重绘）也会推高私有内存，不做对照就会把这份开销
+    /// 误记到 Region 头上 —— 这是本探针第一版踩过的坑。
+    ///
+    /// 用法：<c>DeskLite.exe --gdiresize [轮数=20000] [region|bare]</c>
+    ///   · region（默认）= 带圆角 Region 的设置窗
+    ///   · bare          = 裸窗口对照组
+    /// 两组要<b>分进程</b>跑：同进程里前一组推高的堆水位会污染后一组的基线。
+    /// </summary>
+    private static void RunGdiResize(int rounds, string mode)
+    {
+        Program.Silent = true;
+        Native.AttachConsole(ATTACH_PARENT_PROCESS);
+        Console.OutputEncoding = Encoding.UTF8;
+
+        ApplicationConfiguration.Initialize();
+
+        using var self = System.Diagnostics.Process.GetCurrentProcess();
+        int Gdi() => (int)Native.GetGuiResources(self.Handle, Native.GR_GDIOBJECTS);
+
+        Form w;
+        if (mode == "bare")
+        {
+            w = new Form
+            {
+                StartPosition = FormStartPosition.Manual,
+                Location = new Point(-4000, -4000),   // 屏幕外：测试时不要真闪在用户眼前
+                Size = new Size(560, 580),
+            };
+        }
+        else
+        {
+            w = new UI.SettingsForm(AppSettings.Load(), _ => { }, 0)
+            {
+                StartPosition = FormStartPosition.Manual,
+                Location = new Point(-4000, -4000),
+            };
+        }
+
+        w.Show();
+        Application.DoEvents();
+
+        // 预热：把「建窗这批一次性 GDI 对象」算进基线，否则会被误记成泄漏
+        for (int i = 0; i < 8; i++)
+        {
+            w.ClientSize = new Size(560 + i * 3, 580 + i * 2);
+            Application.DoEvents();
+        }
+
+        int gdi0 = Gdi();
+        long man0 = GC.GetTotalMemory(false);
+        var (_, pv0) = MemInfo.Counters();
+
+        for (int i = 0; i < rounds; i++)
+        {
+            // 尺寸在 560~616 × 580~622 之间来回变 —— 必须真的不同才会触发 WM_SIZE → OnResize
+            w.ClientSize = new Size(560 + (i % 9) * 7, 580 + (i % 7) * 6);
+            Application.DoEvents();
+        }
+
+        long man1 = GC.GetTotalMemory(false);
+        var (_, pv1) = MemInfo.Counters();
+        int gdi1 = Gdi();
+
+        // 收干净再读：Region 的非托管侧靠终结器释放，必须「收 → 等终结 → 再收」
+        CollectAll();
+        int gdi2 = Gdi();
+        long man2 = GC.GetTotalMemory(false);
+        var (_, pv2) = MemInfo.Counters();
+
+        Console.WriteLine($"窗口改尺寸 × {rounds} 次  模式={mode}");
+        Console.WriteLine("                       GDI对象   私有(MB)   托管堆(KB)");
+        Console.WriteLine($"  基线                {gdi0,8}  {pv0 / 1048576.0,9:F1}  {man0 / 1024.0,10:F0}");
+        Console.WriteLine($"  跑完（未收）        {gdi1,8}  {pv1 / 1048576.0,9:F1}  {man1 / 1024.0,10:F0}");
+        Console.WriteLine($"  收干净后            {gdi2,8}  {pv2 / 1048576.0,9:F1}  {man2 / 1024.0,10:F0}");
+        Console.WriteLine($"  Δ（收干净 − 基线）  {(gdi2 - gdi0):+#;-#;0}       " +
+                          $"{(pv2 - pv0) / 1024.0:+#;-#;0} KB    {(man2 - man0) / 1024.0:+#;-#;0} KB");
+        Console.WriteLine($"RESULT|mode={mode}|dgdi={gdi2 - gdi0}|dpriv_kb={(pv2 - pv0) / 1024}" +
+                          $"|dman_kb={(man2 - man0) / 1024}");
+
+        w.Close();
+    }
+
+    /// <summary>把托管堆连同终结器队列一起清干净（Region 这类对象靠终结器释放非托管资源）</summary>
+    private static void CollectAll()
+    {
+        GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+        GC.WaitForPendingFinalizers();
+        GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+        GC.WaitForPendingFinalizers();
+        GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+        Application.DoEvents();
+    }
+
     // ───────────────────────── 右键集成自检 ─────────────────────────
 
     /// <summary>
@@ -2435,6 +2543,7 @@ internal static class Diagnostics
             case "--shot": RunShot(A(args, 1) ?? "shot.png"); return true;
             case "--settingsshot": RunSettingsShot(A(args, 1) ?? "settings.png", Int(args, 2, 0)); return true;
             case "--settingstest": RunSettingsTest(); return true;
+            case "--gdiresize": RunGdiResize(Int(args, 1, 20000), A(args, 2) ?? "region"); return true;
 
             // ── 右键集成 ──
             case "--shelltest" or "--shellinstall" or "--shelluninstall" or "--shellverify":
@@ -2499,20 +2608,49 @@ internal static class Diagnostics
         Native.AttachConsole(ATTACH_PARENT_PROCESS);
         Console.OutputEncoding = Encoding.UTF8;
 
+        // 主程序若正在运行，它的保活巡检会在几秒内把图标重新藏回去 ——
+        // 那种情况下「图标又不见了」不是还原失败，而是接管模式仍在生效。
+        // 如实说清楚，免得用户以为命令没起作用。
+        bool running = IsMainInstanceRunning();
+
         var h = new DesktopHost();
         if (h.Locate())
         {
             h.ShowNativeIcons();                 // 内部会一并清掉崩溃标记
             Console.WriteLine("已显示原生桌面图标（ListView 已 ShowWindow）。");
-            return;
+        }
+        else
+        {
+            // 退到「不依赖 DesktopHost」的最小路径再试一次
+            Console.WriteLine(CrashGuard.EmergencyRestoreDesktop()
+                ? "已显示原生桌面图标（走兜底路径）。"
+                : "未定位到桌面窗口链，无法还原。");
+            CrashGuard.MarkDesktopShown();
         }
 
-        // 退到「不依赖 DesktopHost」的最小路径再试一次
-        Console.WriteLine(CrashGuard.EmergencyRestoreDesktop()
-            ? "已显示原生桌面图标（走兜底路径）。"
-            : "未定位到桌面窗口链，无法还原。");
-        CrashGuard.MarkDesktopShown();
+        if (running)
+            Console.WriteLine("注意：桌面整理 · 精简版 正在运行，它会在几秒后重新接管桌面（图标再次隐藏）。\n" +
+                              "       若要长期保持原生图标，请先从托盘菜单退出本程序。");
     }
+
+    /// <summary>
+    /// 主实例（常驻的那个）是否正在运行。
+    /// 借全局互斥体判断 —— 主流程是 <c>new Mutex(true, ...)</c> 初始持有，
+    /// 所以这里 <c>WaitOne(0)</c> 拿不到就说明它活着；拿得到说明只有我们（用完立即归还）。
+    /// </summary>
+    private static bool IsMainInstanceRunning()
+    {
+        try
+        {
+            using var m = new Mutex(false, Program.MutexName);
+            bool got = false;
+            try { got = m.WaitOne(0); } catch { }
+            if (got) { try { m.ReleaseMutex(); } catch { } return false; }
+            return true;
+        }
+        catch { return false; }
+    }
+
 
     /// <summary>
     /// 极简实验（<c>--hideshot</c>）：隐藏 ListView → 截图 → 恢复。

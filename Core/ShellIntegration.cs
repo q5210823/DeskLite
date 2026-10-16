@@ -167,6 +167,14 @@ public static class ShellIntegration
             WriteChild(root, "sort", "一键整理桌面", $"\"{exe}\" --cmd sort");
             WriteChild(root, "search", "桌面搜索", $"\"{exe}\" --cmd search");
 
+            // 桌面救援入口。刻意放在「桌面背景」范围且不依赖本程序在运行：
+            // 注册表项是持久的，所以哪怕本程序被任务管理器强杀、桌面图标全没了，
+            // 用户只要在桌面空白处右键 → 桌面整理 · 精简版 → 还原桌面图标，
+            // 就能把原生图标要回来（该命令在新进程里跑，不受单实例限制）。
+            // 这是「强杀后无法自我感知」这个物理限制下唯一能自助恢复的入口。
+            if (scope == MenuScope.Desktop)
+                WriteChild(root, "restore", "还原桌面图标", $"\"{exe}\" --restore");
+
             if (includeSendTo)
                 WriteChild(root, "sendto", "送入桌面格子", $"\"{exe}\" --cmd sendto \"%1\"");
         }
